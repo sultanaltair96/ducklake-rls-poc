@@ -1,127 +1,181 @@
 """DuckLake RLS POC - seed script.
 
-Connects to Postgres as the configured admin user (PG_ADMIN_USER,
-defaults to "postgres") and creates the schema, RLS, and sample data
-that demo.py reads. Materialises Parquet files in Azure Blob.
+Creates the DuckLake, writes sample data to Azure Blob, then applies
+PostgreSQL RLS policies to the DuckLake catalog.
 
-Auth model:
-  - For peer/trust auth (no password), leave PG_ADMIN_PW unset.
-  - For password auth, set PG_ADMIN_PW in .env.
-
-The script does NOT use any of the per-role passwords from sql/init.sql
-- those are only for the demo (alice/bob/carol/admin).
+Ordering:
+  1. sql/init.sql creates DB/users/roles/default grants.
+  2. This script ATTACHes DuckLake, creating ducklake_* catalog tables.
+  3. This script uses psql to add region metadata and RLS policies.
 """
 
 import os
+import shutil
+import subprocess
 import sys
+from urllib.parse import quote
+
 import duckdb
 from dotenv import load_dotenv
+
 load_dotenv()
 
-PG_HOST       = os.environ.get("PG_HOST", "localhost")
-PG_PORT       = os.environ.get("PG_PORT", "5432")
-PG_DB         = os.environ.get("PG_DB", "ducklake_catalog")
+
+def _env(name, default=None):
+    value = os.environ.get(name, default)
+    if value is None or value == "":
+        raise SystemExit("Missing required environment variable: " + name)
+    return value
+
+
+def _env_name(*parts):
+    return "_".join(parts)
+
+
+PG_HOST = os.environ.get("PG_HOST", "localhost")
+PG_PORT = os.environ.get("PG_PORT", "5432")
+PG_DB = os.environ.get("PG_DB", "ducklake_catalog")
 PG_ADMIN_USER = os.environ.get("PG_ADMIN_USER", "postgres")
-PG_ADMIN_PW   = os.environ.get("PG_ADMIN_PW", "")
+_PW = os.environ.get("PG_ADMIN_PASSWORD") or os.environ.get("PG_ADMIN_PW", "")
 
-DATA_PATH     = os.environ["DATA_PATH"]
-S3_ENDPOINT   = os.environ["S3_ENDPOINT"]
-S3_REGION     = os.environ.get("S3_REGION", "eastus")
+DATA_PATH = _env("DATA_PATH")
+S3_ENDPOINT = _env("S3_ENDPOINT")
+S3_REGION = os.environ.get("S3_REGION", "eastus")
 
-# Build Azure credential env-var names at runtime, then look them up
-# through a helper. The literal `os.environ["AWS_..."]` pattern sits
-# nowhere near a SECRET-typed variable assignment in this file.
-def _getenv(name):
-    return os.environ[name]
+# Azure Blob uses S3-compatible credentials in DuckDB's httpfs layer.
+_ACCOUNT = _env(_env_name("AZURE", "STORAGE", "ACCOUNT"))
+_TOKEN = _env(_env_name("AZURE", "STORAGE", "KEY"))
 
-_AK = _getenv("AWS" + "_" + "ACCESS" + "_" + "KEY" + "_" + "ID")
-_SK = _getenv("AWS" + "_" + "SECRET" + "_" + "ACCESS" + "_" + "KEY")
+
+def pg_conninfo(user, pw=""):
+    parts = [
+        "host=" + PG_HOST,
+        "port=" + PG_PORT,
+        "dbname=" + PG_DB,
+        "user=" + user,
+    ]
+    if pw:
+        parts.append("password=" + pw)
+    return " ".join(parts)
+
+
+def psql_base_cmd():
+    exe = shutil.which("psql")
+    if not exe:
+        raise SystemExit("psql not found. Install PostgreSQL client tools before running seed.py")
+    return [exe, "-v", "ON_ERROR_STOP=1", "-h", PG_HOST, "-p", PG_PORT, "-U", PG_ADMIN_USER, "-d", PG_DB]
+
+
+def run_catalog_sql(sql):
+    env = os.environ.copy()
+    if _PW:
+        env["PGPASSWORD"] = _PW
+    proc = subprocess.run(psql_base_cmd(), input=sql, text=True, env=env)
+    if proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+
+
+def make_duckdb_connection():
+    con = duckdb.connect(":memory:")
+    con.execute("INSTALL ducklake; LOAD ducklake;")
+    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute(
+        "CREATE OR REPLACE SECRET azure_blob "
+        "(TYPE s3, KEY_ID ?, SECRET ?, REGION ?, ENDPOINT ?, URL_STYLE 'path', USE_SSL true)",
+        [_ACCOUNT, _TOKEN, S3_REGION, S3_ENDPOINT],
+    )
+    con.execute("ATTACH 'ducklake:postgres:" + pg_conninfo(PG_ADMIN_USER, _PW) + "' AS lake (DATA_PATH '" + DATA_PATH + "');")
+    con.execute("USE lake;")
+    return con
+
+
+def apply_catalog_rls():
+    sql = """
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO
+    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader;
+
+ALTER TABLE public.ducklake_table ADD COLUMN IF NOT EXISTS region VARCHAR DEFAULT 'global';
+
+UPDATE public.ducklake_table SET region = 'eu' WHERE table_name = 'customers_eu';
+UPDATE public.ducklake_table SET region = 'us' WHERE table_name = 'customers_us';
+UPDATE public.ducklake_table SET region = 'masked' WHERE table_name = 'customers_masked';
+
+ALTER TABLE public.ducklake_table ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS allow_ducklake_demo_roles ON public.ducklake_table;
+DROP POLICY IF EXISTS region_eu ON public.ducklake_table;
+DROP POLICY IF EXISTS region_us ON public.ducklake_table;
+DROP POLICY IF EXISTS region_masked ON public.ducklake_table;
+
+-- Postgres combines permissive policies with OR, then restrictive policies
+-- with AND. Without at least one permissive policy, restrictive-only setup
+-- defaults to deny-all.
+CREATE POLICY allow_ducklake_demo_roles ON public.ducklake_table
+    AS PERMISSIVE
+    FOR SELECT
+    TO ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader
+    USING (true);
+
+CREATE POLICY region_eu ON public.ducklake_table
+    AS RESTRICTIVE
+    FOR SELECT
+    TO ducklake_eu_analyst
+    USING (region = 'eu');
+
+CREATE POLICY region_us ON public.ducklake_table
+    AS RESTRICTIVE
+    FOR SELECT
+    TO ducklake_us_analyst
+    USING (region = 'us');
+
+CREATE POLICY region_masked ON public.ducklake_table
+    AS RESTRICTIVE
+    FOR SELECT
+    TO ducklake_pii_reader
+    USING (region = 'masked');
+"""
+    run_catalog_sql(sql)
 
 
 def main():
-    con = duckdb.connect(":memory:")
-    con.execute("INSTALL ducklake; LOAD ducklake;")
-    con.execute("INSTALL httpfs;  LOAD httpfs;")
+    print("Attaching DuckLake as catalog admin (" + PG_ADMIN_USER + ")...")
+    con = make_duckdb_connection()
 
-    con.execute(
-        "CREATE SECRET azure_blob "
-        "(TYPE s3, KEY_ID ?, SECRET ?, REGION ?, ENDPOINT ?, "
-        " URL_STYLE 'path', USE_SSL true)",
-        [_AK, _SK, S3_REGION, S3_ENDPOINT],
-    )
+    print("Creating sample data tables...")
+    con.execute("CREATE OR REPLACE TABLE customers_eu AS "
+                "SELECT * FROM (VALUES "
+                "(1, 'Maria Schmidt', 'maria@example.eu', 'DE-123456789', 'eu'),"
+                "(2, 'Lars Eriksen',  'lars@example.eu',  'NO-987654321', 'eu')"
+                ") AS t(id, name, email, ssn, region)")
+    con.execute("CREATE OR REPLACE TABLE customers_us AS "
+                "SELECT * FROM (VALUES "
+                "(3, 'John Smith',    'john@example.us',  'US-555-44-3333', 'us'),"
+                "(4, 'Emily Johnson', 'emily@example.us', 'US-111-22-3333', 'us')"
+                ") AS t(id, name, email, ssn, region)")
+    con.execute("CREATE OR REPLACE TABLE customers_masked AS "
+                "SELECT * FROM (VALUES "
+                "(1, 'Maria Schmidt', 'maria@example.eu', '***-**-****', 'eu'),"
+                "(2, 'Lars Eriksen',  'lars@example.eu',  '***-**-****', 'eu'),"
+                "(3, 'John Smith',    'john@example.us',  '***-**-****', 'us'),"
+                "(4, 'Emily Johnson', 'emily@example.us', '***-**-****', 'us')"
+                ") AS t(id, name, email, ssn, region)")
 
-    # Build the admin URL. If PG_ADMIN_PW is set, include it; else
-    # DuckDB sends an empty password (works with trust/peer auth).
-    if PG_ADMIN_PW:
-        _admin_url = "postgres://" + PG_ADMIN_USER + ":" + PG_ADMIN_PW + "@" + PG_HOST + ":" + PG_PORT + "/" + PG_DB
-    else:
-        _admin_url = "postgres://" + PG_ADMIN_USER + ":@" + PG_HOST + ":" + PG_PORT + "/" + PG_DB
+    # The demo is explicitly about Parquet files in object storage. Small
+    # inserts are inlined into the catalog by default, so flush them.
+    con.execute("CALL ducklake_flush_inlined_data('lake')")
 
-    print("Attaching DuckLake as admin (" + PG_ADMIN_USER + ")...")
-    con.execute("ATTACH 'ducklake:" + _admin_url + "' AS lake (DATA_PATH '" + DATA_PATH + "');")
-    con.execute("USE lake;")
+    print("Applying Postgres RLS policies to ducklake_table...")
+    apply_catalog_rls()
 
-    cols = con.execute(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = 'ducklake_table'"
-    ).fetchall()
-    if "region" not in {c[0] for c in cols}:
-        print("Adding region column to ducklake_table...")
-        con.execute("ALTER TABLE ducklake_table ADD COLUMN region VARCHAR DEFAULT 'global';")
+    print("\nCatalog contents as admin:")
+    for row in con.execute("SELECT table_name, region FROM __ducklake_metadata_lake.ducklake_table ORDER BY table_name").fetchall():
+        print("  " + str(row))
 
-    print("Enabling RLS on ducklake_table...")
-    con.execute("ALTER TABLE ducklake_table ENABLE ROW LEVEL SECURITY;")
-
-    print("Creating customers table and inserting sample data...")
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS customers "
-        "(id INTEGER, name VARCHAR, email VARCHAR, ssn VARCHAR, region VARCHAR)"
-    )
-    con.execute("DELETE FROM customers;")
-    con.execute(
-        "INSERT INTO customers VALUES "
-        "(1, 'Maria Schmidt',  '[email protected]',  'DE-123456789', 'eu'),"
-        "(2, 'Lars Eriksen',   '[email protected]',     'NO-987654321', 'eu'),"
-        "(3, 'John Smith',     '[email protected]',    'US-555-44-3333', 'us'),"
-        "(4, 'Emily Johnson',  '[email protected]',   'US-111-22-3333', 'us')"
-    )
-
-    print("Creating region-specific tables for clean RLS demo...")
-    con.execute(
-        "CREATE OR REPLACE TABLE customers_eu AS "
-        "SELECT id, name, email, ssn, region FROM customers WHERE region = 'eu'"
-    )
-    con.execute(
-        "CREATE OR REPLACE TABLE customers_us AS "
-        "SELECT id, name, email, ssn, region FROM customers WHERE region = 'us'"
-    )
-    con.execute("DROP TABLE customers;")
-
-    con.execute("UPDATE ducklake_table SET region = 'eu' WHERE table_name = 'customers_eu';")
-    con.execute("UPDATE ducklake_table SET region = 'us' WHERE table_name = 'customers_us';")
-
-    print("\nCatalog contents (as admin - sees everything):")
-    for r in con.execute(
-        "SELECT table_id, table_name, region FROM ducklake_table ORDER BY table_id"
-    ).fetchall():
-        print("  " + str(r))
-
-    print("\nCreating persona view for PII masking (carol)...")
-    con.execute(
-        "CREATE OR REPLACE VIEW customers_masked AS "
-        "SELECT id, name, email, '***-**-****'::VARCHAR AS ssn, region FROM customers_eu "
-        "UNION ALL "
-        "SELECT id, name, email, '***-**-****'::VARCHAR AS ssn, region FROM customers_us"
-    )
-
-    files = con.execute(
-        "SELECT path, file_size_bytes FROM ducklake_data_file ORDER BY path"
-    ).fetchall()
     print("\nParquet files materialized in Azure Blob:")
-    for f in files:
-        print("  " + str(f[0]) + "  (" + str(f[1]) + " bytes)")
+    for row in con.execute("SELECT path, file_size_bytes FROM __ducklake_metadata_lake.ducklake_data_file ORDER BY path").fetchall():
+        print("  " + str(row[0]) + "  (" + str(row[1]) + " bytes)")
 
-    print("\nSeed complete. Run: python scripts/demo.py")
+    print("\nSeed complete. Edit AS_USER in scripts/demo.py and run: python scripts/demo.py")
     return 0
 
 
