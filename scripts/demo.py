@@ -15,7 +15,8 @@ load_dotenv()
 
 # CHANGE THIS to switch roles.
 # Valid: "admin" (sees all raw rows), "alice" (EU only),
-#        "bob" (US only), "carol" (all rows, SSN masked)
+#        "bob" (US only), "carol" (all rows, SSN masked),
+#        "eu-limited" (EU only, SSN masked), "us-limited" (US only, SSN masked)
 AS_USER = "admin"
 
 
@@ -35,8 +36,6 @@ PG_PORT = os.environ.get("PG_PORT", "5432")
 PG_DB = os.environ.get("PG_DB", "ducklake_catalog")
 
 DATA_PATH = _env("DATA_PATH")
-S3_ENDPOINT = _env("S3_ENDPOINT")
-S3_REGION = os.environ.get("S3_REGION", "eastus")
 
 _ACCOUNT = _env(_env_name("AZURE", "STORAGE", "ACCOUNT"))
 _TOKEN = _env(_env_name("AZURE", "STORAGE", "KEY"))
@@ -46,6 +45,8 @@ USERS = {
     "alice": ("alice", "alice_pw", "SELECT id, name, email, ssn, region FROM customers_eu ORDER BY id"),
     "bob":   ("bob", "bob_pw", "SELECT id, name, email, ssn, region FROM customers_us ORDER BY id"),
     "carol": ("carol", "carol_pw", "SELECT id, name, email, ssn, region FROM customers_masked ORDER BY id"),
+    "eu-limited": ("eu_limited", "eu_limited_pw", "SELECT id, name, email, ssn, region FROM customers_masked WHERE region = 'eu' ORDER BY id"),
+    "us-limited": ("us_limited", "us_limited_pw", "SELECT id, name, email, ssn, region FROM customers_masked WHERE region = 'us' ORDER BY id"),
 }
 
 
@@ -62,11 +63,10 @@ def pg_conninfo(user, pw):
 def make_duckdb_connection(pg_user, pw):
     con = duckdb.connect(":memory:")
     con.execute("INSTALL ducklake; LOAD ducklake;")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute("INSTALL azure; LOAD azure;")
     con.execute(
-        "CREATE OR REPLACE SECRET azure_blob "
-        "(TYPE s3, KEY_ID ?, SECRET ?, REGION ?, ENDPOINT ?, URL_STYLE 'path', USE_SSL true)",
-        [_ACCOUNT, _TOKEN, S3_REGION, S3_ENDPOINT],
+        "SET azure_storage_connection_string = ?",
+        ["DefaultEndpointsProtocol=https;AccountName=" + _ACCOUNT + ";AccountKey=" + _TOKEN + ";EndpointSuffix=core.windows.net"],
     )
     con.execute("ATTACH 'ducklake:postgres:" + pg_conninfo(pg_user, pw) + "' AS lake (DATA_PATH '" + DATA_PATH + "');")
     con.execute("USE lake;")
@@ -89,7 +89,7 @@ def main():
     print("=" * 70)
     con = make_duckdb_connection(pg_user, pw)
 
-    visible = con.execute("SELECT table_name, region FROM __ducklake_metadata_lake.ducklake_table ORDER BY table_name").fetchall()
+    visible = con.execute("SELECT table_name, region FROM __ducklake_metadata_lake.ducklake_table WHERE end_snapshot IS NULL ORDER BY table_name").fetchall()
     print("Visible DuckLake catalog tables after Postgres RLS:")
     print("  " + str(visible or "NONE"))
     print()
@@ -102,7 +102,7 @@ def main():
     print_rows(rows, cols)
     print()
     print(str(len(rows)) + " row(s)")
-    print("Expected: admin=4 raw rows, alice=2 EU rows, bob=2 US rows, carol=4 masked rows.")
+    print("Expected: admin=4 raw rows, alice=2 EU rows, bob=2 US rows, carol=4 masked rows, eu-limited=2 masked EU rows, us-limited=2 masked US rows.")
 
 
 if __name__ == "__main__":

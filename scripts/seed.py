@@ -39,10 +39,8 @@ PG_ADMIN_USER = os.environ.get("PG_ADMIN_USER", "postgres")
 _PW = os.environ.get("PG_ADMIN_PASSWORD") or os.environ.get("PG_ADMIN_PW", "")
 
 DATA_PATH = _env("DATA_PATH")
-S3_ENDPOINT = _env("S3_ENDPOINT")
-S3_REGION = os.environ.get("S3_REGION", "eastus")
 
-# Azure Blob uses S3-compatible credentials in DuckDB's httpfs layer.
+# Azure Blob credentials used by DuckDB's Azure filesystem extension.
 _ACCOUNT = _env(_env_name("AZURE", "STORAGE", "ACCOUNT"))
 _TOKEN = _env(_env_name("AZURE", "STORAGE", "KEY"))
 
@@ -78,11 +76,10 @@ def run_catalog_sql(sql):
 def make_duckdb_connection():
     con = duckdb.connect(":memory:")
     con.execute("INSTALL ducklake; LOAD ducklake;")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
+    con.execute("INSTALL azure; LOAD azure;")
     con.execute(
-        "CREATE OR REPLACE SECRET azure_blob "
-        "(TYPE s3, KEY_ID ?, SECRET ?, REGION ?, ENDPOINT ?, URL_STYLE 'path', USE_SSL true)",
-        [_ACCOUNT, _TOKEN, S3_REGION, S3_ENDPOINT],
+        "SET azure_storage_connection_string = ?",
+        ["DefaultEndpointsProtocol=https;AccountName=" + _ACCOUNT + ";AccountKey=" + _TOKEN + ";EndpointSuffix=core.windows.net"],
     )
     con.execute("ATTACH 'ducklake:postgres:" + pg_conninfo(PG_ADMIN_USER, _PW) + "' AS lake (DATA_PATH '" + DATA_PATH + "');")
     con.execute("USE lake;")
@@ -92,7 +89,8 @@ def make_duckdb_connection():
 def apply_catalog_rls():
     sql = """
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO
-    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader;
+    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader,
+    ducklake_eu_limited, ducklake_us_limited;
 
 ALTER TABLE public.ducklake_table ADD COLUMN IF NOT EXISTS region VARCHAR DEFAULT 'global';
 
@@ -106,6 +104,8 @@ DROP POLICY IF EXISTS allow_ducklake_demo_roles ON public.ducklake_table;
 DROP POLICY IF EXISTS region_eu ON public.ducklake_table;
 DROP POLICY IF EXISTS region_us ON public.ducklake_table;
 DROP POLICY IF EXISTS region_masked ON public.ducklake_table;
+DROP POLICY IF EXISTS "eu-limited" ON public.ducklake_table;
+DROP POLICY IF EXISTS "us-limited" ON public.ducklake_table;
 
 -- Postgres combines permissive policies with OR, then restrictive policies
 -- with AND. Without at least one permissive policy, restrictive-only setup
@@ -113,7 +113,8 @@ DROP POLICY IF EXISTS region_masked ON public.ducklake_table;
 CREATE POLICY allow_ducklake_demo_roles ON public.ducklake_table
     AS PERMISSIVE
     FOR SELECT
-    TO ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader
+    TO ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader,
+       ducklake_eu_limited, ducklake_us_limited
     USING (true);
 
 CREATE POLICY region_eu ON public.ducklake_table
@@ -132,6 +133,18 @@ CREATE POLICY region_masked ON public.ducklake_table
     AS RESTRICTIVE
     FOR SELECT
     TO ducklake_pii_reader
+    USING (region = 'masked');
+
+CREATE POLICY "eu-limited" ON public.ducklake_table
+    AS RESTRICTIVE
+    FOR SELECT
+    TO ducklake_eu_limited
+    USING (region = 'masked');
+
+CREATE POLICY "us-limited" ON public.ducklake_table
+    AS RESTRICTIVE
+    FOR SELECT
+    TO ducklake_us_limited
     USING (region = 'masked');
 """
     run_catalog_sql(sql)
@@ -168,7 +181,7 @@ def main():
     apply_catalog_rls()
 
     print("\nCatalog contents as admin:")
-    for row in con.execute("SELECT table_name, region FROM __ducklake_metadata_lake.ducklake_table ORDER BY table_name").fetchall():
+    for row in con.execute("SELECT table_name, region FROM __ducklake_metadata_lake.ducklake_table WHERE end_snapshot IS NULL ORDER BY table_name").fetchall():
         print("  " + str(row))
 
     print("\nParquet files materialized in Azure Blob:")

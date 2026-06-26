@@ -3,7 +3,7 @@
 This repo demonstrates a small but realistic governance pattern:
 
 - DuckLake stores table metadata in PostgreSQL.
-- DuckLake stores the actual data as Parquet files in Azure Blob via DuckDB's S3-compatible client.
+- DuckLake stores the actual data as Parquet files in Azure Blob via DuckDB's Azure filesystem extension.
 - PostgreSQL Row-Level Security (RLS) controls which DuckLake catalog rows a role can see.
 - A simple persona router (`AS_USER` in `scripts/demo.py`) shows different results for admin, EU analyst, US analyst, and a PII-masked reader.
 
@@ -16,7 +16,7 @@ This is deliberately not a web service, not Terraform, and not Docker. It is the
 DuckLake is an open table format from the DuckDB team. It has two parts:
 
 1. **Catalog** - normal SQL tables such as `ducklake_table`, `ducklake_data_file`, and `ducklake_snapshot`. In this POC the catalog lives in PostgreSQL.
-2. **Data files** - immutable Parquet files. In this POC they live in Azure Blob Storage, addressed through an S3-compatible URL such as `s3://ducklake-data/`.
+2. **Data files** - immutable Parquet files. In this POC they live in Azure Blob Storage, addressed through an Azure URL such as `az://ducklake-data/`.
 
 When DuckDB queries a DuckLake table, it first asks the catalog which table/data files exist. That makes the catalog a useful governance choke point.
 
@@ -57,8 +57,8 @@ In DuckLake, filtering `ducklake_table` changes which DuckLake tables are visibl
                           v
 +--------------------------------------------------+
 | Azure Blob Storage                               |
-|   s3://ducklake-data/main/customers_eu/*.parquet |
-|   s3://ducklake-data/main/customers_us/*.parquet |
+|   az://ducklake-data/main/customers_eu/*.parquet |
+|   az://ducklake-data/main/customers_us/*.parquet |
 +--------------------------------------------------+
 ```
 
@@ -68,9 +68,10 @@ The demo creates three DuckLake tables:
 |---|---|---|
 | `customers_eu` | `eu` | admin, alice |
 | `customers_us` | `us` | admin, bob |
-| `customers_masked` | `masked` | carol |
+| `customers_masked` | `masked` | carol, eu-limited, us-limited |
 
 `customers_masked` is the column-masked projection: same rows, but `ssn` is replaced with `***-**-****`.
+The limited personas use the masked projection plus a service-layer region filter, so `eu-limited` sees masked EU rows and `us-limited` sees masked US rows.
 
 ---
 
@@ -109,9 +110,7 @@ PG_ADMIN_PASSWORD=postgres
 AZURE_STORAGE_ACCOUNT=youraccountname
 AZURE_STORAGE_KEY=your_storage_account_key
 AZURE_CONTAINER=ducklake-data
-S3_ENDPOINT=https://youraccountname.blob.core.windows.net
-S3_REGION=eastus
-DATA_PATH=s3://ducklake-data/
+DATA_PATH=az://ducklake-data/
 ```
 
 `PG_ADMIN_PASSWORD` can be blank if your local Postgres uses peer/trust authentication.
@@ -129,8 +128,8 @@ psql -U postgres -f sql/init.sql
 This creates:
 
 - database: `ducklake_catalog`
-- group roles: `ducklake_admin`, `ducklake_eu_analyst`, `ducklake_us_analyst`, `ducklake_pii_reader`
-- login users: `admin`, `alice`, `bob`, `carol`
+- group roles: `ducklake_admin`, `ducklake_eu_analyst`, `ducklake_us_analyst`, `ducklake_pii_reader`, `ducklake_eu_limited`, `ducklake_us_limited`
+- login users: `admin`, `alice`, `bob`, `carol`, `eu_limited`, `us_limited`
 - default privileges for future DuckLake catalog tables
 
 Important: `init.sql` does **not** create RLS policies yet. On a fresh database, `ducklake_table` does not exist until DuckLake is first attached. `scripts/seed.py` applies RLS after the catalog tables exist.
@@ -147,12 +146,12 @@ python scripts/seed.py
 
 What `seed.py` does:
 
-1. Installs and loads DuckDB extensions: `ducklake` and `httpfs`.
-2. Creates an Azure/S3 secret for DuckDB using `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_KEY`.
+1. Installs and loads DuckDB extensions: `ducklake` and `azure`.
+2. Configures DuckDB's Azure filesystem extension using `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_KEY`.
 3. Attaches the DuckLake as the Postgres admin user:
    ```sql
    ATTACH 'ducklake:postgres:host=localhost port=5432 dbname=ducklake_catalog user=postgres password=postgres'
-       AS lake (DATA_PATH 's3://ducklake-data/');
+       AS lake (DATA_PATH 'az://ducklake-data/');
    ```
 4. Creates three DuckLake tables:
    - `customers_eu`
@@ -173,14 +172,16 @@ What `seed.py` does:
    CREATE POLICY region_eu ON public.ducklake_table ...;
    CREATE POLICY region_us ON public.ducklake_table ...;
    CREATE POLICY region_masked ON public.ducklake_table ...;
+   CREATE POLICY "eu-limited" ON public.ducklake_table ...;
+   CREATE POLICY "us-limited" ON public.ducklake_table ...;
    ```
 
 After this step you should see Parquet files in Azure Blob under paths like:
 
 ```text
-s3://ducklake-data/main/customers_eu/...
-s3://ducklake-data/main/customers_us/...
-s3://ducklake-data/main/customers_masked/...
+az://ducklake-data/main/customers_eu/...
+az://ducklake-data/main/customers_us/...
+az://ducklake-data/main/customers_masked/...
 ```
 
 ---
@@ -201,6 +202,8 @@ Valid values:
 | `alice` | `alice` | 2 EU rows only |
 | `bob` | `bob` | 2 US rows only |
 | `carol` | `carol` | 4 rows with masked SSN |
+| `eu-limited` | `eu_limited` | 2 EU rows with masked SSN |
+| `us-limited` | `us_limited` | 2 US rows with masked SSN |
 
 Run:
 
@@ -262,7 +265,7 @@ This is not a full Unity Catalog replacement. It is a minimal, working shape for
 - **`psql not found`** - install PostgreSQL client tools. `seed.py` uses `psql` to apply catalog RLS after DuckLake creates the catalog tables.
 - **`ducklake_table does not exist` during init** - you are using an old README/script. Current `init.sql` does not touch `ducklake_table`; `seed.py` does.
 - **`Missing required environment variable: AZURE_STORAGE_KEY`** - fill `.env` from `.env.example`.
-- **`IO Error ... blob.core.windows.net`** - check `S3_ENDPOINT`, `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, and `DATA_PATH`.
+- **`IO Error ... blob.core.windows.net`** - check `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, and `DATA_PATH`.
 - **Alice/Bob/Carol see no catalog tables** - rerun `python scripts/seed.py`; the RLS policies and region tags are applied there.
 
 ---

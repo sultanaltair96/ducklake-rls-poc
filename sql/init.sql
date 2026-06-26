@@ -36,17 +36,28 @@ DO $$ BEGIN
     CREATE ROLE ducklake_pii_reader NOLOGIN;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
+DO $$ BEGIN
+    CREATE ROLE ducklake_eu_limited NOLOGIN;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE ROLE ducklake_us_limited NOLOGIN;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
 GRANT USAGE ON SCHEMA public TO
-    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader;
+    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader,
+    ducklake_eu_limited, ducklake_us_limited;
 
 -- Catalog tables are auto-created by DuckLake on first ATTACH. These grants
 -- apply to future objects created by the role that runs this init script.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO
-    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader;
+    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader,
+    ducklake_eu_limited, ducklake_us_limited;
 
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO
-    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader;
+    ducklake_admin, ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader,
+    ducklake_eu_limited, ducklake_us_limited;
 
 -- =====================================================================
 -- 2. Login roles (the demo script authenticates as these)
@@ -67,4 +78,12 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
     CREATE USER admin WITH PASSWORD 'admin_pw' IN ROLE ducklake_admin SUPERUSER;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE USER eu_limited WITH PASSWORD 'eu_limited_pw' IN ROLE ducklake_eu_limited;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+DO $$ BEGIN
+    CREATE USER us_limited WITH PASSWORD 'us_limited_pw' IN ROLE ducklake_us_limited;
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
