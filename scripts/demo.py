@@ -1,27 +1,29 @@
-"""DuckLake RLS POC - single-file demo.
+"""DuckLake RLS POC - single-table service-layer policy demo.
 
 This file is the "pretend application" layer for the POC.
 
-seed.py builds the lake and configures catalog RLS. demo.py shows what happens
-when different application users connect through different PostgreSQL roles.
+seed.py builds one canonical DuckLake table named `customers`. demo.py shows how
+a service layer can enforce row filtering and column masking without physically
+duplicating data into many separate lake tables.
 
 The important split:
 
-- PostgreSQL RLS controls which DuckLake catalog rows a role can see.
-- The query chosen by this script controls which safe table/projection the
-  application reads from.
+- PostgreSQL RLS controls whether a role can discover the `customers` DuckLake
+  catalog entry.
+- This service layer controls which rows and columns are returned for each
+  persona.
 
-That is why the limited personas work like this:
+That gives us the scalable model we wanted:
 
-- eu-limited can discover only `customers_masked` in the DuckLake catalog.
-- demo.py then queries `customers_masked WHERE region = 'eu'`.
-- Result: EU rows only, with SSNs already masked.
+- Store customer data once: `customers`.
+- Apply region filters in SQL: `WHERE region = 'eu'` or `WHERE region = 'us'`.
+- Apply masking in SQL: `'***-**-****' AS ssn`.
 
-Same idea for us-limited.
+This is intentionally not claiming DuckLake itself does native column masking.
+The service/query layer is the enforcement point for row filters and masks.
 """
 
 import os
-from urllib.parse import quote
 
 import duckdb
 from dotenv import load_dotenv
@@ -33,12 +35,12 @@ load_dotenv()
 # CHANGE THIS to switch roles.
 #
 # Valid values:
-#   "admin"      -> sees raw EU + raw US rows
-#   "alice"      -> sees raw EU rows only
-#   "bob"        -> sees raw US rows only
-#   "carol"      -> sees all rows, but only through the masked table
-#   "eu-limited" -> sees EU rows only, through the masked table
-#   "us-limited" -> sees US rows only, through the masked table
+#   "admin"      -> all regions, raw SSN
+#   "alice"      -> EU only, raw SSN
+#   "bob"        -> US only, raw SSN
+#   "carol"      -> all regions, masked SSN
+#   "eu-limited" -> EU only, masked SSN
+#   "us-limited" -> US only, masked SSN
 AS_USER = "admin"
 
 
@@ -74,54 +76,42 @@ _TOKEN = _env(_env_name("AZURE", "STORAGE", "KEY"))
 # Each entry is:
 #   AS_USER value -> (Postgres login, Postgres password, query to run)
 #
-# The Postgres login is important because DuckLake uses it to read the catalog.
-# If the login is alice, PostgreSQL RLS filters ducklake_table so DuckDB can only
-# discover the catalog rows alice is allowed to see.
+# The Postgres login is still important: DuckLake uses it to read the catalog,
+# and PostgreSQL RLS decides whether `customers` is discoverable at all.
 #
-# The query is the service/application routing decision. For raw analysts it
-# chooses the raw regional table. For masked/limited users it chooses the masked
-# projection.
+# The SQL query is the service-layer policy. This is where we avoid physical data
+# duplication: everyone reads from the same `customers` table, but the SELECT
+# list and WHERE clause differ per persona.
 USERS = {
     "admin": (
         "admin",
         "admin_pw",
-        "SELECT id, name, email, ssn, region "
-        "FROM customers_eu "
-        "UNION ALL "
-        "SELECT id, name, email, ssn, region "
-        "FROM customers_us "
-        "ORDER BY id",
+        "SELECT id, name, email, ssn, region FROM customers ORDER BY id",
     ),
     "alice": (
         "alice",
         "alice_pw",
-        "SELECT id, name, email, ssn, region FROM customers_eu ORDER BY id",
+        "SELECT id, name, email, ssn, region FROM customers WHERE region = 'eu' ORDER BY id",
     ),
     "bob": (
         "bob",
         "bob_pw",
-        "SELECT id, name, email, ssn, region FROM customers_us ORDER BY id",
+        "SELECT id, name, email, ssn, region FROM customers WHERE region = 'us' ORDER BY id",
     ),
     "carol": (
         "carol",
         "carol_pw",
-        "SELECT id, name, email, ssn, region FROM customers_masked ORDER BY id",
+        "SELECT id, name, email, '***-**-****' AS ssn, region FROM customers ORDER BY id",
     ),
     "eu-limited": (
         "eu_limited",
         "eu_limited_pw",
-        "SELECT id, name, email, ssn, region "
-        "FROM customers_masked "
-        "WHERE region = 'eu' "
-        "ORDER BY id",
+        "SELECT id, name, email, '***-**-****' AS ssn, region FROM customers WHERE region = 'eu' ORDER BY id",
     ),
     "us-limited": (
         "us_limited",
         "us_limited_pw",
-        "SELECT id, name, email, ssn, region "
-        "FROM customers_masked "
-        "WHERE region = 'us' "
-        "ORDER BY id",
+        "SELECT id, name, email, '***-**-****' AS ssn, region FROM customers WHERE region = 'us' ORDER BY id",
     ),
 }
 
@@ -138,17 +128,18 @@ def pg_conninfo(user, pw):
 
 
 def make_duckdb_connection(pg_user, pw):
-    """Create DuckDB connection as one specific demo persona.
+    """Create a DuckDB connection as one specific demo persona.
 
-    This function is where identity becomes authorization:
+    This function is where identity reaches the catalog:
 
     1. DuckDB loads DuckLake and Azure support.
     2. DuckDB receives Azure credentials so it can read Parquet files.
     3. DuckDB ATTACHes the DuckLake using the selected PostgreSQL login.
 
     Because ATTACH uses that login, PostgreSQL RLS applies when DuckDB reads the
-    DuckLake catalog. Different users therefore discover different DuckLake
-    tables before any query runs.
+    DuckLake catalog. In this one-table version, every demo persona can discover
+    `customers`; the service-layer query then applies the persona-specific row
+    filter and/or SSN mask.
     """
     con = duckdb.connect(":memory:")
 
@@ -165,11 +156,6 @@ def make_duckdb_connection(pg_user, pw):
     )
 
     # Attach the DuckLake catalog using the persona's PostgreSQL login.
-    #
-    # Example expansion:
-    #   ATTACH 'ducklake:postgres:host=localhost port=5432 dbname=ducklake_catalog user=alice password=alice_pw'
-    #       AS lake (DATA_PATH 'az://ducklake-one/');
-    #
     # `USE lake` makes subsequent SQL queries refer to DuckLake tables by default.
     con.execute("ATTACH 'ducklake:postgres:" + pg_conninfo(pg_user, pw) + "' AS lake (DATA_PATH '" + DATA_PATH + "');")
     con.execute("USE lake;")
@@ -198,18 +184,18 @@ def main():
     con = make_duckdb_connection(pg_user, pw)
 
     # This query reads DuckLake's metadata view. It proves PostgreSQL RLS is
-    # filtering catalog visibility. If alice sees only customers_eu here, DuckDB
-    # cannot discover customers_us through this attached catalog connection.
+    # filtering catalog visibility. In the scalable version, all personas should
+    # see only the single canonical table: customers.
     #
     # end_snapshot IS NULL means "current table version only". DuckLake keeps
     # history, and repeated seed runs leave older table versions in the catalog.
-    visible = con.execute("SELECT table_name, region FROM __ducklake_metadata_lake.ducklake_table WHERE end_snapshot IS NULL ORDER BY table_name").fetchall()
+    visible = con.execute("SELECT table_name FROM __ducklake_metadata_lake.ducklake_table WHERE end_snapshot IS NULL ORDER BY table_name").fetchall()
     print("Visible DuckLake catalog tables after Postgres RLS:")
     print("  " + str(visible or "NONE"))
     print()
 
-    # This is the application routing part. RLS controls what tables are visible;
-    # the service layer still chooses the safe query for the authenticated user.
+    # This is the application routing part. RLS controls discovery; this query
+    # controls row filtering and column masking.
     print("Query routed by persona:")
     print("  " + sql)
     print()
@@ -220,7 +206,7 @@ def main():
     print_rows(rows, cols)
     print()
     print(str(len(rows)) + " row(s)")
-    print("Expected: admin=4 raw rows, alice=2 EU rows, bob=2 US rows, carol=4 masked rows, eu-limited=2 masked EU rows, us-limited=2 masked US rows.")
+    print("Expected: admin=4 raw rows, alice=2 EU raw rows, bob=2 US raw rows, carol=4 masked rows, eu-limited=2 masked EU rows, us-limited=2 masked US rows.")
 
 
 if __name__ == "__main__":

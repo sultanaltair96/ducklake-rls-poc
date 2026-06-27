@@ -1,11 +1,11 @@
-# DuckLake + PostgreSQL RLS + Column Masking - Step Zero POC
+# DuckLake + PostgreSQL RLS + Service-Layer Masking - Step Zero POC
 
 This repo demonstrates a small but realistic governance pattern:
 
 - DuckLake stores table metadata in PostgreSQL.
 - DuckLake stores the actual data as Parquet files in Azure Blob via DuckDB's Azure filesystem extension.
-- PostgreSQL Row-Level Security (RLS) controls which DuckLake catalog rows a role can see.
-- A simple persona router (`AS_USER` in `scripts/demo.py`) shows different results for admin, EU analyst, US analyst, and a PII-masked reader.
+- PostgreSQL Row-Level Security (RLS) controls which DuckLake catalog rows a role can discover.
+- A simple persona router (`AS_USER` in `scripts/demo.py`) applies row filters and SSN masking in the service/query layer.
 
 This is deliberately not a web service, not Terraform, and not Docker. It is the smallest useful POC: SQL + two Python scripts.
 
@@ -27,51 +27,59 @@ PostgreSQL Row-Level Security lets the database silently filter rows based on th
 ```sql
 ALTER TABLE ducklake_table ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY region_eu ON ducklake_table
-    AS RESTRICTIVE
-    FOR ALL
+CREATE POLICY allow_customer_table ON ducklake_table
+    FOR SELECT
     TO ducklake_eu_analyst
-    USING (region = 'eu')
-    WITH CHECK (region = 'eu');
+    USING (table_name = 'customers');
 ```
 
-In DuckLake, filtering `ducklake_table` changes which DuckLake tables are visible to a role. That is how this POC demonstrates catalog-level access control.
+In DuckLake, filtering `ducklake_table` changes which DuckLake tables are visible to a role. This POC uses that for catalog-level access control.
+
+Important: PostgreSQL RLS here governs DuckLake **metadata discovery**, not the customer rows inside Parquet files. Row filtering and SSN masking happen in `scripts/demo.py`.
 
 ## 0.6 What you will build
 
-```
+```text
 +--------------------------------------------------+
 | scripts/demo.py                                  |
-|   change AS_USER = admin / alice / bob / carol   |
+|   AS_USER maps to a safe SQL query               |
+|   region filter + SSN mask happen here           |
 +-------------------------+------------------------+
                           |
                           | ATTACH 'ducklake:postgres:host=... user=...'
                           v
 +--------------------------------------------------+
 | PostgreSQL catalog                               |
-|   ducklake_table has extra column: region         |
-|   RLS policies filter visible catalog rows        |
+|   ducklake_table says customers exists           |
+|   RLS controls catalog discovery                 |
 +-------------------------+------------------------+
                           |
                           | paths in ducklake_data_file
                           v
 +--------------------------------------------------+
 | Azure Blob Storage                               |
-|   az://ducklake-data/main/customers_eu/*.parquet |
-|   az://ducklake-data/main/customers_us/*.parquet |
+|   az://ducklake-data/main/customers/*.parquet    |
 +--------------------------------------------------+
 ```
 
-The demo creates three DuckLake tables:
+The demo now creates one physical DuckLake table:
 
-| Table | Region tag in catalog | Who sees it |
+| Table | What it contains | Who can discover it |
 |---|---|---|
-| `customers_eu` | `eu` | admin, alice |
-| `customers_us` | `us` | admin, bob |
-| `customers_masked` | `masked` | carol, eu-limited, us-limited |
+| `customers` | EU + US rows with raw SSNs | all demo personas |
 
-`customers_masked` is the column-masked projection: same rows, but `ssn` is replaced with `***-**-****`.
-The limited personas use the masked projection plus a service-layer region filter, so `eu-limited` sees masked EU rows and `us-limited` sees masked US rows.
+The persona-specific behavior is implemented in the service-layer query:
+
+| Persona | Row filter | SSN expression |
+|---|---|---|
+| `admin` | none | raw `ssn` |
+| `alice` | `region = 'eu'` | raw `ssn` |
+| `bob` | `region = 'us'` | raw `ssn` |
+| `carol` | none | `'***-**-****' AS ssn` |
+| `eu-limited` | `region = 'eu'` | `'***-**-****' AS ssn` |
+| `us-limited` | `region = 'us'` | `'***-**-****' AS ssn` |
+
+This avoids the earlier non-scalable pattern of physically duplicating data into `customers_eu`, `customers_us`, and `customers_masked`.
 
 ---
 
@@ -132,7 +140,7 @@ This creates:
 - login users: `admin`, `alice`, `bob`, `carol`, `eu_limited`, `us_limited`
 - default privileges for future DuckLake catalog tables
 
-Important: `init.sql` does **not** create RLS policies yet. On a fresh database, `ducklake_table` does not exist until DuckLake is first attached. `scripts/seed.py` applies RLS after the catalog tables exist.
+Important: `init.sql` does **not** create RLS policies on `ducklake_table`. On a fresh database, `ducklake_table` does not exist until DuckLake is first attached. `scripts/seed.py` applies RLS after the catalog tables exist.
 
 ---
 
@@ -153,40 +161,31 @@ What `seed.py` does:
    ATTACH 'ducklake:postgres:host=localhost port=5432 dbname=ducklake_catalog user=postgres password=postgres'
        AS lake (DATA_PATH 'az://ducklake-data/');
    ```
-4. Creates three DuckLake tables:
-   - `customers_eu`
-   - `customers_us`
-   - `customers_masked`
-5. Flushes the tiny demo rows out of DuckLake's inlined catalog storage and into Parquet:
+4. Drops old demo tables from earlier versions if they exist: `customers_eu`, `customers_us`, `customers_masked`.
+5. Creates one canonical DuckLake table: `customers`.
+6. Flushes tiny demo rows out of DuckLake's inlined catalog storage and into Parquet:
    ```sql
    CALL ducklake_flush_inlined_data('lake');
    ```
-6. Uses `psql` to update the PostgreSQL catalog:
+7. Uses `psql` to update the PostgreSQL catalog:
    ```sql
-   ALTER TABLE public.ducklake_table ADD COLUMN IF NOT EXISTS region VARCHAR DEFAULT 'global';
-   UPDATE public.ducklake_table SET region = 'eu' WHERE table_name = 'customers_eu';
-   UPDATE public.ducklake_table SET region = 'us' WHERE table_name = 'customers_us';
-   UPDATE public.ducklake_table SET region = 'masked' WHERE table_name = 'customers_masked';
    ALTER TABLE public.ducklake_table ENABLE ROW LEVEL SECURITY;
-   CREATE POLICY allow_ducklake_demo_roles ON public.ducklake_table ...;
-   CREATE POLICY region_eu ON public.ducklake_table ...;
-   CREATE POLICY region_us ON public.ducklake_table ...;
-   CREATE POLICY region_masked ON public.ducklake_table ...;
-   CREATE POLICY "eu-limited" ON public.ducklake_table ...;
-   CREATE POLICY "us-limited" ON public.ducklake_table ...;
+   CREATE POLICY allow_customer_table ON public.ducklake_table
+       FOR SELECT
+       TO ducklake_eu_analyst, ducklake_us_analyst, ducklake_pii_reader,
+          ducklake_eu_limited, ducklake_us_limited
+       USING (table_name = 'customers');
    ```
 
 After this step you should see Parquet files in Azure Blob under paths like:
 
 ```text
-az://ducklake-data/main/customers_eu/...
-az://ducklake-data/main/customers_us/...
-az://ducklake-data/main/customers_masked/...
+az://ducklake-data/main/customers/...
 ```
 
 ---
 
-## 5. Step 3 - demonstrate RLS and column masking
+## 5. Step 3 - demonstrate RLS, row filtering, and masking
 
 Open `scripts/demo.py` and change:
 
@@ -199,8 +198,8 @@ Valid values:
 | `AS_USER` | Postgres login | Expected result |
 |---|---|---|
 | `admin` | `admin` | 4 raw rows from EU + US |
-| `alice` | `alice` | 2 EU rows only |
-| `bob` | `bob` | 2 US rows only |
+| `alice` | `alice` | 2 EU rows with raw SSN |
+| `bob` | `bob` | 2 US rows with raw SSN |
 | `carol` | `carol` | 4 rows with masked SSN |
 | `eu-limited` | `eu_limited` | 2 EU rows with masked SSN |
 | `us-limited` | `us_limited` | 2 US rows with masked SSN |
@@ -213,22 +212,36 @@ python scripts/demo.py
 
 The script prints two things:
 
-1. **Visible DuckLake catalog tables after Postgres RLS** - this proves RLS is active.
-2. **The routed query result** - this shows the rows each persona gets.
+1. **Visible DuckLake catalog tables after Postgres RLS** - every persona should see only `customers`.
+2. **The routed query result** - this shows the service-layer row filter and/or SSN mask for that persona.
 
-This is intentionally similar to a tiny service layer: authenticated identity maps to a safe table/projection.
+This is intentionally similar to a tiny service layer: authenticated identity maps to a safe query.
 
 ---
 
 ## 6. What just happened?
 
-- Alice, Bob, and Carol connect to the **same DuckLake**.
-- The data lives in the **same Azure Blob container**.
-- The difference is the **Postgres role** used in the DuckLake `ATTACH` string.
-- PostgreSQL RLS filters rows in `ducklake_table`, so each role sees a different catalog surface.
-- Carol's column masking is shown through the `customers_masked` projection.
+- Every persona connects to the **same DuckLake**.
+- The customer data is stored once in the **same Azure Blob table path**.
+- PostgreSQL RLS limits catalog discovery to the single canonical table: `customers`.
+- `scripts/demo.py` applies the actual row filtering and masking policy.
 
-This is not a full Unity Catalog replacement. It is a minimal, working shape for catalog-controlled DuckLake access through one query surface.
+Example service-layer queries:
+
+```sql
+-- admin
+SELECT id, name, email, ssn, region
+FROM customers
+ORDER BY id;
+
+-- eu-limited
+SELECT id, name, email, '***-**-****' AS ssn, region
+FROM customers
+WHERE region = 'eu'
+ORDER BY id;
+```
+
+This is not a full Unity Catalog replacement. It is a minimal, working shape for catalog-controlled DuckLake access plus service-layer row/column policy enforcement.
 
 ---
 
@@ -236,37 +249,69 @@ This is not a full Unity Catalog replacement. It is a minimal, working shape for
 
 ### `AS_USER = "admin"`
 
-- Visible catalog tables: `customers_eu`, `customers_us`, `customers_masked`
+- Visible catalog tables: `customers`
 - Result rows: 4
 - SSNs: raw
 
 ### `AS_USER = "alice"`
 
-- Visible catalog tables: `customers_eu`
+- Visible catalog tables: `customers`
 - Result rows: 2
 - Region: `eu`
+- SSNs: raw
 
 ### `AS_USER = "bob"`
 
-- Visible catalog tables: `customers_us`
+- Visible catalog tables: `customers`
 - Result rows: 2
 - Region: `us`
+- SSNs: raw
 
 ### `AS_USER = "carol"`
 
-- Visible catalog tables: `customers_masked`
+- Visible catalog tables: `customers`
 - Result rows: 4
+- SSNs: `***-**-****`
+
+### `AS_USER = "eu-limited"`
+
+- Visible catalog tables: `customers`
+- Result rows: 2
+- Region: `eu`
+- SSNs: `***-**-****`
+
+### `AS_USER = "us-limited"`
+
+- Visible catalog tables: `customers`
+- Result rows: 2
+- Region: `us`
 - SSNs: `***-**-****`
 
 ---
 
-## 8. Troubleshooting
+## 8. Tests
+
+Run the fast source-level regression tests:
+
+```bash
+python -m unittest discover -v
+```
+
+These tests verify that:
+
+- all persona queries read from the single `customers` table
+- region filtering and masking are encoded as expected
+- `seed.py` creates only one customer DuckLake table
+
+---
+
+## 9. Troubleshooting
 
 - **`psql not found`** - install PostgreSQL client tools. `seed.py` uses `psql` to apply catalog RLS after DuckLake creates the catalog tables.
 - **`ducklake_table does not exist` during init** - you are using an old README/script. Current `init.sql` does not touch `ducklake_table`; `seed.py` does.
 - **`Missing required environment variable: AZURE_STORAGE_KEY`** - fill `.env` from `.env.example`.
 - **`IO Error ... blob.core.windows.net`** - check `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, and `DATA_PATH`.
-- **Alice/Bob/Carol see no catalog tables** - rerun `python scripts/seed.py`; the RLS policies and region tags are applied there.
+- **Personas see no catalog tables** - rerun `python scripts/seed.py`; the RLS policy is applied there.
 
 ---
 
@@ -278,7 +323,9 @@ ducklake-rls-poc/
 ├── README.md
 ├── sql/
 │   └── init.sql
-└── scripts/
-    ├── seed.py
-    └── demo.py
+├── scripts/
+│   ├── seed.py
+│   └── demo.py
+└── tests/
+    └── test_single_table_policy_model.py
 ```
